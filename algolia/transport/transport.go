@@ -23,6 +23,8 @@ import (
 
 const version = "3.26.1"
 
+const MaxRetryCount = 10
+
 type Transport struct {
 	requester     Requester
 	retryStrategy *RetryStrategy
@@ -103,60 +105,76 @@ func (t *Transport) Request(
 	exposeIntermediateNetworkErrors := iopt.ExtractExposeIntermediateNetworkErrors(opts...).Get()
 	var intermediateNetworkErrors []error
 
-	for _, h := range t.retryStrategy.GetTryableHosts(k) {
-		req, err := buildRequest(t.compression, method, h.host, path, body, headers, urlParams)
-		if err != nil {
-			return err
-		}
-
-		// Handle per-request timeout by using a context with timeout.
-		// Note that because we are in a loop, the cancel() callback cannot be
-		// deferred. Instead, we call it precisely after the end of each loop or
-		// before the early returns, but when we do so, we do it **after**
-		// reading the body content of the response. Otherwise, a `context
-		// cancelled` error may happen when the body is read.
-		perRequestCtx, cancel := context.WithTimeout(ctx, h.timeout)
-		req = req.WithContext(perRequestCtx)
-		bodyRes, code, err := t.request(req)
-
-		// Context error only returns a non-nil error upon context
-		// cancellation, which is a signal we interpret as an early return.
-		// Indeed, we do not want to retry on other hosts if the context is
-		// already cancelled.
-		if ctx.Err() != nil {
-			cancel()
-			return err
-		}
-
-		switch t.retryStrategy.Decide(h, code, err) {
-		case Success:
-			err = unmarshalTo(bodyRes, &res)
-			cancel()
-			return err
-		case Failure:
-			if bodyRes != nil {
-				err = unmarshalToError(bodyRes)
-			} else if err == nil {
-				err = fmt.Errorf("undefined network error with code: %v", code)
-			}
-			cancel()
-			return err
-		default:
+	for i := 0; i < MaxRetryCount; i++ {
+		for _, h := range t.retryStrategy.GetTryableHosts(k) {
+			req, err := buildRequest(t.compression, method, h.host, path, body, headers, urlParams)
 			if err != nil {
-				intermediateNetworkErrors = append(intermediateNetworkErrors, err)
-			} else {
-				responseErr := unmarshalToError(bodyRes)
-				intermediateNetworkErrors = append(intermediateNetworkErrors, responseErr)
+				return err
 			}
-			if bodyRes != nil {
-				if err = bodyRes.Close(); err != nil {
-					cancel()
-					return fmt.Errorf("cannot close response's body before retry: %v", err)
+
+			// Handle per-request timeout by using a context with timeout.
+			// Note that because we are in a loop, the cancel() callback cannot be
+			// deferred. Instead, we call it precisely after the end of each loop or
+			// before the early returns, but when we do so, we do it **after**
+			// reading the body content of the response. Otherwise, a `context
+			// cancelled` error may happen when the body is read.
+			perRequestCtx, cancel := context.WithTimeout(ctx, h.timeout)
+			req = req.WithContext(perRequestCtx)
+			bodyRes, code, err := t.request(req)
+
+			// Context error only returns a non-nil error upon context
+			// cancellation, which is a signal we interpret as an early return.
+			// Indeed, we do not want to retry on other hosts if the context is
+			// already cancelled.
+			if ctx.Err() != nil {
+				cancel()
+				return err
+			}
+
+			switch t.retryStrategy.Decide(h, code, err) {
+			case Success:
+				err = unmarshalTo(bodyRes, &res)
+				cancel()
+				return err
+			case Failure:
+				if bodyRes != nil {
+					err = unmarshalToError(bodyRes)
+				} else if err == nil {
+					err = fmt.Errorf("undefined network error with code: %v", code)
+				}
+				cancel()
+				return err
+			case Retry:
+				if err != nil {
+					intermediateNetworkErrors = append(intermediateNetworkErrors, err)
+				} else {
+					responseErr := unmarshalToError(bodyRes)
+					intermediateNetworkErrors = append(intermediateNetworkErrors, responseErr)
+				}
+				if bodyRes != nil {
+					if err = bodyRes.Close(); err != nil {
+						cancel()
+						return fmt.Errorf("cannot close response's body before retry: %v", err)
+					}
+				}
+				cancel()
+			default:
+				if err != nil {
+					intermediateNetworkErrors = append(intermediateNetworkErrors, err)
+				} else {
+					responseErr := unmarshalToError(bodyRes)
+					intermediateNetworkErrors = append(intermediateNetworkErrors, responseErr)
+				}
+				if bodyRes != nil {
+					if err = bodyRes.Close(); err != nil {
+						cancel()
+						return fmt.Errorf("cannot close response's body before retry: %v", err)
+					}
 				}
 			}
-		}
 
-		cancel()
+			cancel()
+		}
 	}
 
 	if exposeIntermediateNetworkErrors {
