@@ -3,8 +3,10 @@ package transport
 import (
 	"bytes"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
@@ -80,7 +82,7 @@ func TestShouldExposeIntermediateNetworkErrors(t *testing.T) {
 	err := transporter.Request(&res, http.MethodGet, "", nil, call.Read, opts...)
 	noMoreHostToTryErr, ok := err.(*errs.NoMoreHostToTryErr)
 	require.True(t, ok)
-	require.Len(t, noMoreHostToTryErr.IntermediateNetworkErrors(), 1)
+	require.Len(t, noMoreHostToTryErr.IntermediateNetworkErrors(), 10)
 }
 
 func TestUnmarshallTo(t *testing.T) {
@@ -150,6 +152,47 @@ func TestOnNetworkErrorWithNilBody(t *testing.T) {
 	err := transporter.Request(&res, http.MethodGet, "", nil, call.Read, opts...)
 	noMoreHostToTryErr, ok := err.(*errs.NoMoreHostToTryErr)
 	require.True(t, ok)
-	require.Len(t, noMoreHostToTryErr.IntermediateNetworkErrors(), 1)
+	require.Len(t, noMoreHostToTryErr.IntermediateNetworkErrors(), 10)
 	require.Equal(t, noMoreHostToTryErr.IntermediateNetworkErrors()[0].Error(), "cannot perform request:\n\terror=oh no\n\tmethod=GET\n\turl=https:")
+}
+
+type longTimeRequester struct {
+	count int
+}
+
+func (r *longTimeRequester) Request(req *http.Request) (*http.Response, error) {
+	r.count++
+	select {
+	case <-req.Context().Done():
+		return nil, req.Context().Err()
+	case <-time.After(300 * time.Microsecond):
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       io.NopCloser(strings.NewReader(`{"Status":"OK"}`)),
+		}, nil
+	}
+}
+
+func TestShouldRetry(t *testing.T) {
+	hosts := []*StatefulHost{
+		NewStatefulHost("1", call.IsReadWrite),
+		NewStatefulHost("2", call.IsReadWrite),
+	}
+	requester := &longTimeRequester{}
+	transporter := New(
+		hosts,
+		requester,
+		"appID",
+		"apiKey",
+		200*time.Microsecond,
+		200*time.Microsecond,
+		nil,
+		"",
+		compression.None,
+	)
+	var res struct{ Status string }
+	err := transporter.Request(&res, http.MethodGet, "", nil, call.Read)
+	require.NoError(t, err)
+	require.Equal(t, "OK", res.Status)
+	require.Equal(t, 3, requester.count, "(2 Hosts * 1 try) + (1 Host * 1 retry) = 3")
 }
